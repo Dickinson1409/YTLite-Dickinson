@@ -1,0 +1,111 @@
+name: script-testing
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  RDP_USER: RDP
+  TS_VERSION: "1.88.3"
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 350
+    steps:
+      - name: Enable + Firewall
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0 -Force
+          Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 0 -Force
+          Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name SecurityLayer -Value 0 -Force
+          netsh advfirewall firewall set rule group="Remote Desktop" new enable=Yes | Out-Null
+          netsh advfirewall firewall delete rule name="RDP (3389) Allow (GH)" | Out-Null
+          netsh advfirewall firewall add rule name="RDP (3389) Allow (GH)" dir=in action=allow protocol=TCP localport=3389 | Out-Null
+          Set-Service -Name TermService -StartupType Automatic
+          Restart-Service -Name TermService -Force
+
+      - name: Create/Reset local user
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $u = $env:RDP_USER
+          Add-Type -AssemblyName System.Security
+          $upper=[char[]](65..90); $lower=[char[]](97..122); $num=[char[]](48..57)
+          $spec=([char[]](33..47)+[char[]](58..64)+[char[]](91..96)+[char[]](123..126))
+          $raw = @()
+          $raw += $upper | Get-Random -Count 4
+          $raw += $lower | Get-Random -Count 4
+          $raw += $num   | Get-Random -Count 4
+          $raw += $spec  | Get-Random -Count 4
+          $pwd = -join ($raw | Sort-Object {Get-Random})
+          $sp  = ConvertTo-SecureString $pwd -AsPlainText -Force
+
+          if (Get-LocalUser -Name $u -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $u -Password $sp -PasswordNeverExpires $true -AccountNeverExpires $true
+          } else {
+            New-LocalUser -Name $u -Password $sp -AccountNeverExpires
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member $u -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u -ErrorAction SilentlyContinue
+
+          "RDP_USER=$u"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RDP_PASS=$pwd" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install (MSI)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-$($env:TS_VERSION)-amd64.msi"
+          $msi = Join-Path $env:TEMP "tailscale.msi"
+          Invoke-WebRequest -Uri $url -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
+          Remove-Item $msi -Force
+
+      - name: Fetch IPv4
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ts = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          & $ts up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-win-$env:GITHUB_RUN_ID
+
+          $ip = $null
+          1..12 | ForEach-Object {
+            $ip = (& $ts ip -4 | Select-Object -First 1).Trim()
+            if ($ip) { return }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $ip) { throw "No Tailscale IPv4 assigned." }
+          "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Verify (TCP/3389)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ok = (Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389).TcpTestSucceeded
+          if (-not $ok) { throw "TCP 3389 test failed." }
+          Write-Host "TCP 3389 reachable at $env:TAILSCALE_IP"
+
+      - name: Show connection info + keep alive
+        run: |
+          $msg = @"
+          ### RDP over Tailscale
+          - Address : $env:TAILSCALE_IP
+          - Username: $env:RDP_USER
+          - Password: $env:RDP_PASS
+          _Note: job will stop at GitHub Actions timeout._
+          "@
+          $msg | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address : $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: $env:RDP_PASS"
+          Write-Host "===================`n"
+
+          while ($true) {
+            Write-Host "[$(Get-Date -Format o)] RDP active..."
+            Start-Sleep -Seconds 30
+          }
